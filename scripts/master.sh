@@ -1,0 +1,77 @@
+#!/bin/bash
+set -euo pipefail
+exec > >(tee /var/log/k8s-master-init.log) 2>&1
+
+echo "==> [1/7] System preparation"
+hostnamectl set-hostname master
+dnf update -y
+
+swapoff -a
+sed -i '/swap/d' /etc/fstab
+
+cat <<MODULES > /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+MODULES
+modprobe overlay
+modprobe br_netfilter
+
+cat <<SYSCTL > /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+SYSCTL
+sysctl --system
+
+echo "==> [2/7] Installing containerd"
+dnf install -y containerd
+mkdir -p /etc/containerd
+containerd config default > /etc/containerd/config.toml
+sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+systemctl enable --now containerd
+
+echo "==> [3/7] Adding Kubernetes ${k8s_version} repo"
+cat <<REPO > /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=https://pkgs.k8s.io/core:/stable:/v${k8s_version}/rpm/
+enabled=1
+gpgcheck=1
+gpgkey=https://pkgs.k8s.io/core:/stable:/v${k8s_version}/rpm/repodata/repomd.xml.key
+exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
+REPO
+
+echo "==> [4/7] Installing kubeadm kubelet kubectl"
+dnf install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
+systemctl enable --now kubelet
+
+echo "==> [5/7] Initialising control plane"
+MASTER_PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+MASTER_PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+
+kubeadm init \
+  --pod-network-cidr="${pod_network_cidr}" \
+  --apiserver-advertise-address="$MASTER_PRIVATE_IP" \
+  --apiserver-cert-extra-sans="$MASTER_PUBLIC_IP" \
+  --node-name="master" \
+  --ignore-preflight-errors=NumCPU \
+  2>&1 | tee /var/log/kubeadm-init.log
+
+echo "==> [6/7] Configuring kubectl"
+mkdir -p /home/ec2-user/.kube
+cp /etc/kubernetes/admin.conf /home/ec2-user/.kube/config
+chown ec2-user:ec2-user /home/ec2-user/.kube/config
+export KUBECONFIG=/etc/kubernetes/admin.conf
+
+echo "==> [7/7] Installing Flannel CNI"
+kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+
+JOIN_CMD=$(kubeadm token create --print-join-command)
+echo "$JOIN_CMD" > /home/ec2-user/worker-join-command.sh
+chmod +x /home/ec2-user/worker-join-command.sh
+chown ec2-user:ec2-user /home/ec2-user/worker-join-command.sh
+
+echo "============================================================"
+echo "  Master node ready!"
+echo "  JOIN COMMAND saved at: ~/worker-join-command.sh"
+echo "============================================================"
